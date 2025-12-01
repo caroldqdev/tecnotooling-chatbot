@@ -1,4 +1,4 @@
-# rag_final.py
+# rag_with_history.py
 import os
 import numpy as np
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -70,13 +70,13 @@ async def search_similar_docs(query_embedding, top_k=None):
         else:
             top_indices = np.argsort(sims)[::-1][:top_k]
 
-        # Evitar chunks repetidos
+        # Evitar chunks repetidos e adicionar nome do arquivo
         seen_files = set()
         top_texts = []
         for idx in top_indices:
             fname = file_names[idx]
             if fname not in seen_files:
-                top_texts.append(texts[idx])
+                top_texts.append(f"[{fname}] {texts[idx]}")
                 seen_files.add(fname)
 
         logging.info(f"Total de documentos retornados: {len(top_texts)}")
@@ -87,23 +87,38 @@ async def search_similar_docs(query_embedding, top_k=None):
         return "Não foi possível buscar contexto relevante."
 
 # -----------------------------
-# FUNÇÃO 3: Gerar resposta com RAG
+# FUNÇÃO 3: Gerar resposta com RAG + histórico
 # -----------------------------
-async def rag_answer(query: str, top_k=None):
+async def rag_answer(query: str, history=None, top_k=None):
+    """
+    query: pergunta atual do usuário
+    history: lista de mensagens anteriores, ex:
+        [
+            {"role": "user", "content": "Pergunta anterior"},
+            {"role": "assistant", "content": "Resposta anterior"}
+        ]
+    top_k: quantos documentos buscar
+    """
+    if history is None:
+        history = []
+
     query_emb = await get_embedding(query)
     context = await search_similar_docs(query_emb, top_k=top_k)
 
+    # Prompt principal
     prompt = f"""
-Você é um assistente útil.
+Você é um assistente útil da TecnoTooling.
+
+Sempre que usar informação de algum documento, cite o nome do arquivo entre colchetes.
+Use o contexto completo abaixo para responder à pergunta.
 
 CONTEXTO RELEVANTE:
 {context}
 
-PERGUNTA:
+PERGUNTA ATUAL:
 {query}
-
-Responda de forma clara e objetiva, trazendo informações completas.
 """
+
     logging.info(f"Prompt enviado ao Groq (primeiros 500 chars):\n{prompt[:500]}")
 
     try:
@@ -111,13 +126,15 @@ Responda de forma clara e objetiva, trazendo informações completas.
         import httpx
         groq_client = Groq(api_key=GROQ_API_KEY, http_client=httpx.Client())
 
+        # Construir histórico + pergunta atual
+        messages = [{"role": "system", "content": "Você se chama Too, assistente da TecnoTooling. Seja detalhista e sempre cite os documentos."}]
+        messages.extend(history)  # mensagens anteriores
+        messages.append({"role": "user", "content": prompt})  # pergunta atual
+
         response = groq_client.chat.completions.create(
             model=MODEL_LLM,
-            messages=[
-                {"role": "system", "content": "Você se chama Too, o assistente da TecnoTooling. Seja prestativo e detalhista."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=600  # aumentar se quiser respostas mais completas
+            messages=messages,
+            max_tokens=600
         )
 
         message_obj = response.choices[0].message
