@@ -1,4 +1,4 @@
-# rag_with_history_cohere.py
+# rag_cohere_chat.py
 import os
 import numpy as np
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,7 +16,7 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
 if not COHERE_API_KEY or not MONGO_URI:
-    raise Exception("Erro: Chave de API Cohere ou Mongo não encontrada.")
+    raise Exception("Erro: COHERE_API_KEY ou MONGO_URI não encontrados.")
 
 # -----------------------------
 # CLIENTES
@@ -26,8 +26,8 @@ client = AsyncIOMotorClient(MONGO_URI)
 db_embeddings = client.file_data
 collection_embeddings = db_embeddings.get_collection("embeddings")
 
-MODEL_LLM = "command-xlarge-nightly"  # novo LLM do Cohere
 MODEL_EMBED = "embed-multilingual-v2.0"
+MODEL_LLM = "command-xlarge-nightly"  # LLM Cohere Chat mais recente
 EMBED_DIM = 768
 
 # -----------------------------
@@ -58,13 +58,11 @@ async def search_similar_docs(query_embedding, top_k=None):
         texts = [doc["text"] for doc in docs]
         file_names = [doc.get("file_name", f"doc_{i}") for i, doc in enumerate(docs)]
 
+        # Similaridade cosseno
         norms = np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_embedding) + 1e-10
         sims = (embeddings @ query_embedding) / norms
 
-        if top_k is None:
-            top_indices = np.argsort(sims)[::-1]
-        else:
-            top_indices = np.argsort(sims)[::-1][:top_k]
+        top_indices = np.argsort(sims)[::-1] if top_k is None else np.argsort(sims)[::-1][:top_k]
 
         seen_files = set()
         top_texts = []
@@ -82,9 +80,18 @@ async def search_similar_docs(query_embedding, top_k=None):
         return "Não foi possível buscar contexto relevante."
 
 # -----------------------------
-# FUNÇÃO 3: Gerar resposta com RAG + histórico usando Cohere LLM
+# FUNÇÃO 3: Gerar resposta com RAG + histórico
 # -----------------------------
 async def rag_answer(query: str, history=None, top_k=None):
+    """
+    query: pergunta atual do usuário
+    history: lista de mensagens anteriores, ex:
+        [
+            {"role": "user", "content": "Pergunta anterior"},
+            {"role": "assistant", "content": "Resposta anterior"}
+        ]
+    top_k: quantos documentos buscar
+    """
     if history is None:
         history = []
 
@@ -103,26 +110,24 @@ PERGUNTA ATUAL:
 {query}
 """
 
-    logging.info(f"Prompt enviado ao Cohere (primeiros 500 chars):\n{prompt[:500]}")
+    logging.info(f"Prompt enviado ao Cohere Chat (primeiros 500 chars):\n{prompt[:500]}")
 
     try:
-        # Concatenar histórico em uma string para o Cohere LLM
-        full_prompt = ""
-        for h in history:
-            role = h["role"]
-            content = h["content"]
-            full_prompt += f"{role.upper()}: {content}\n"
-        full_prompt += f"USER: {prompt}\nASSISTANT:"
+        # Construir histórico + pergunta atual
+        messages = [{"role": "system", "content": "Você se chama Too, assistente da TecnoTooling. Seja detalhista e sempre cite os documentos."}]
+        messages.extend(history)  # mensagens anteriores
+        messages.append({"role": "user", "content": prompt})  # pergunta atual
 
-        response = co.generate(
+        response = co.chat(
             model=MODEL_LLM,
-            prompt=full_prompt,
-            max_tokens=600,
-            temperature=0.3,  # respostas mais focadas
-            stop_sequences=["USER:"]
+            messages=messages,
+            max_tokens=600
         )
 
-        return response.generations[0].text.strip()
+        if response.output and len(response.output) > 0:
+            return response.output[0].content
+        else:
+            return "Desculpe, não consegui gerar uma resposta."
 
     except Exception as e:
         logging.error(f"Erro ao gerar resposta com Cohere LLM: {e}")
