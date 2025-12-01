@@ -210,6 +210,12 @@ async def chat_history(chat_id: str, current_user=Depends(get_user_from_token)):
         history.append({"sender": msg["sender"], "text": msg["text"]})
     return {"messages": history}
 
+@app.delete("/delete-chat/{chat_id}")
+async def delete_chat(chat_id: str, current_user=Depends(get_user_from_token)):
+    result = await collection_history.delete_many({"chat_id": chat_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Chat não encontrado")
+    return {"message": f"{result.deleted_count} mensagens deletadas"}
 
 # --- MAIN ---
 if __name__ == "__main__":
@@ -219,3 +225,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True
     )
+
