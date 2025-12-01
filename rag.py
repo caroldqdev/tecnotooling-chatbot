@@ -1,4 +1,4 @@
-# rag_optimized.py
+# rag_final.py
 import os
 import numpy as np
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,49 +9,53 @@ import asyncio
 
 load_dotenv()
 
-# ---- CONFIGURAÇÕES ----
+# -----------------------------
+# CONFIGURAÇÕES
+# -----------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not GROQ_API_KEY:
-    raise Exception("Erro: GROQ_API_KEY não encontrada.")
-if not COHERE_API_KEY:
-    raise Exception("Erro: COHERE_API_KEY não encontrada.")
-if not MONGO_URI:
-    raise Exception("Erro: MONGO_URI não encontrada.")
+if not GROQ_API_KEY or not COHERE_API_KEY or not MONGO_URI:
+    raise Exception("Erro: Uma ou mais chaves de API não foram encontradas.")
 
-# ---- CLIENTES ----
-co = cohere.Client(COHERE_API_KEY)  # Embeddings Cohere
-
-# ---- MONGO ----
+# -----------------------------
+# CLIENTES
+# -----------------------------
+co = cohere.Client(COHERE_API_KEY)
 client = AsyncIOMotorClient(MONGO_URI)
 db_embeddings = client.file_data
 collection_embeddings = db_embeddings.get_collection("embeddings")
 
-# Modelos
 MODEL_LLM = "groq/compound-mini"
 MODEL_EMBED = "embed-multilingual-v2.0"
-EMBED_DIM = 768  # garantir 768 dimensões
+EMBED_DIM = 768
 
-# -------- FUNÇÃO 1: gerar embedding (Cohere) --------
+# -----------------------------
+# FUNÇÃO 1: Gerar embedding
+# -----------------------------
 async def get_embedding(text: str):
     try:
         response = co.embed(texts=[text], model=MODEL_EMBED)
         emb = np.array(response.embeddings[0], dtype=np.float32)
+        # Garantir 768 dimensões
         if emb.shape[0] != EMBED_DIM:
             logging.warning(f"Embedding inesperado ({emb.shape[0]} dims), ajustando para {EMBED_DIM}")
             emb = np.resize(emb, EMBED_DIM)
-        logging.info(f"Embedding gerado ({len(emb)} dims)")
         return emb
     except Exception as e:
         logging.error(f"Erro ao gerar embedding: {e}")
         return np.zeros(EMBED_DIM, dtype=np.float32)
 
-# -------- FUNÇÃO 2: buscar top-k documentos similares --------
-async def search_similar_docs(query_embedding, top_k=5):
+# -----------------------------
+# FUNÇÃO 2: Buscar documentos similares
+# -----------------------------
+async def search_similar_docs(query_embedding, top_k=None):
     try:
         docs = await collection_embeddings.find().to_list(length=None)
+        if not docs:
+            return "Nenhum documento encontrado na base."
+
         embeddings = np.array([np.array(doc["embedding"], dtype=np.float32) for doc in docs])
         texts = [doc["text"] for doc in docs]
         file_names = [doc.get("file_name", f"doc_{i}") for i, doc in enumerate(docs)]
@@ -60,10 +64,13 @@ async def search_similar_docs(query_embedding, top_k=5):
         norms = np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_embedding) + 1e-10
         sims = (embeddings @ query_embedding) / norms
 
-        # Top-k índices
-        top_indices = np.argsort(sims)[::-1][:top_k]
+        # Se top_k não definido, pega todos documentos
+        if top_k is None:
+            top_indices = np.argsort(sims)[::-1]
+        else:
+            top_indices = np.argsort(sims)[::-1][:top_k]
 
-        # Agrupar por documento (evita chunks repetidos)
+        # Evitar chunks repetidos
         seen_files = set()
         top_texts = []
         for idx in top_indices:
@@ -72,17 +79,19 @@ async def search_similar_docs(query_embedding, top_k=5):
                 top_texts.append(texts[idx])
                 seen_files.add(fname)
 
-        logging.info(f"Top {len(top_texts)} documentos retornados")
+        logging.info(f"Total de documentos retornados: {len(top_texts)}")
         return "\n".join(top_texts)
 
     except Exception as e:
         logging.error(f"Erro ao buscar documentos similares: {e}")
         return "Não foi possível buscar contexto relevante."
 
-# -------- FUNÇÃO 3: gerar resposta com RAG --------
-async def rag_answer(query: str):
+# -----------------------------
+# FUNÇÃO 3: Gerar resposta com RAG
+# -----------------------------
+async def rag_answer(query: str, top_k=None):
     query_emb = await get_embedding(query)
-    context = await search_similar_docs(query_emb, top_k=5)
+    context = await search_similar_docs(query_emb, top_k=top_k)
 
     prompt = f"""
 Você é um assistente útil.
@@ -93,9 +102,9 @@ CONTEXTO RELEVANTE:
 PERGUNTA:
 {query}
 
-Responda de forma clara e objetiva, sempre trazendo respostas que envolvam a TecnoTooling
+Responda de forma clara e objetiva, trazendo informações completas.
 """
-    logging.info(f"Prompt enviado ao Groq:\n{prompt[:500]}...")  # primeiros 500 chars
+    logging.info(f"Prompt enviado ao Groq (primeiros 500 chars):\n{prompt[:500]}")
 
     try:
         from groq import Groq
@@ -105,10 +114,10 @@ Responda de forma clara e objetiva, sempre trazendo respostas que envolvam a Tec
         response = groq_client.chat.completions.create(
             model=MODEL_LLM,
             messages=[
-                {"role": "system", "content": "Você se chama Too, o assistente dos colaboradores da TecnoTooling. Seja prestativo e atencioso."},
+                {"role": "system", "content": "Você se chama Too, o assistente da TecnoTooling. Seja prestativo e detalhista."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=300
+            max_tokens=600  # aumentar se quiser respostas mais completas
         )
 
         message_obj = response.choices[0].message
