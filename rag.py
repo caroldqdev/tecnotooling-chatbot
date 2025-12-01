@@ -81,7 +81,7 @@ CONTEXTO RELEVANTE:
 PERGUNTA:
 {query}
 
-Responda de forma clara e objetiva.
+Responda de forma clara e objetiva, sempre trazando respostas que envolvam a Tecnotooling
 """
     logging.info(f"Prompt final enviado para o Groq:\n{prompt[:500]}...")  # primeiros 500 caracteres
 
@@ -93,7 +93,7 @@ Responda de forma clara e objetiva.
         response = groq_client.chat.completions.create(
             model=MODEL_LLM,
             messages=[
-                {"role": "system", "content": "Você é um assistente útil."},
+                {"role": "system", "content": "Você se chama Too, o assistente dos colaboradores da TecnoTooling. Você deve ser prestativo e atencioso"},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=300
