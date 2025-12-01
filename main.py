@@ -10,6 +10,10 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer
+from dependencies import get_current_user
+from typing import List
+from pymongo import MongoClient
+from bson import ObjectId
 
 # --- RAG Import ---
 from rag import rag_answer
@@ -70,6 +74,14 @@ class LoginRequest(BaseModel):
 class ChatRequest(BaseModel):
     chat_id: str | None = None
     message: str
+
+class ChatSummary(BaseModel):
+    chat_id: str
+    last_timestamp: datetime
+
+class User(BaseModel):
+    id: str
+    email: str
 
 
 # --- FUNÇÕES AUXILIARES ---
@@ -209,6 +221,31 @@ async def chat_history(chat_id: str, current_user=Depends(get_user_from_token)):
     async for msg in cursor:
         history.append({"sender": msg["sender"], "text": msg["text"]})
     return {"messages": history}
+
+@app.get("/last-chats", response_model=List[ChatSummary])
+async def get_last_chats(current_user: User = Depends(get_current_user)):
+    """
+    Retorna os 5 chats mais recentes do usuário logado.
+    """
+
+    # Pipeline de agregação para pegar os últimos 5 chats
+    pipeline = [
+        {"$match": {"user_id": current_user.id}},           # Filtra mensagens do usuário
+        {"$sort": {"timestamp": -1}},                       # Ordena pela mensagem mais recente
+        {"$group": {"_id": "$chat_id", "last_timestamp": {"$first": "$timestamp"}}},  # Agrupa por chat
+        {"$sort": {"last_timestamp": -1}},                 # Ordena pelo timestamp da última mensagem do chat
+        {"$limit": 5}                                      # Limita a 5 chats
+    ]
+
+    last_chats = list(collection_history.aggregate(pipeline))
+
+    # Formata a resposta
+    result = [
+        {"chat_id": str(c["_id"]), "last_timestamp": c["last_timestamp"]}
+        for c in last_chats
+    ]
+
+    return result
 
 @app.delete("/delete-chat/{chat_id}")
 async def delete_chat(chat_id: str, current_user=Depends(get_user_from_token)):
