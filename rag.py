@@ -1,4 +1,4 @@
-# rag_cohere_chat.py
+# rag_with_cohere_chat.py
 import os
 import numpy as np
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,7 +16,7 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
 if not COHERE_API_KEY or not MONGO_URI:
-    raise Exception("Erro: COHERE_API_KEY ou MONGO_URI não encontrados.")
+    raise Exception("Erro: Uma ou mais chaves de API não foram encontradas.")
 
 # -----------------------------
 # CLIENTES
@@ -26,8 +26,8 @@ client = AsyncIOMotorClient(MONGO_URI)
 db_embeddings = client.file_data
 collection_embeddings = db_embeddings.get_collection("embeddings")
 
+MODEL_LLM = "command-xlarge-nightly"  # exemplo de LLM Cohere
 MODEL_EMBED = "embed-multilingual-v2.0"
-MODEL_LLM = "command-xlarge-nightly"  # LLM Cohere Chat mais recente
 EMBED_DIM = 768
 
 # -----------------------------
@@ -62,7 +62,11 @@ async def search_similar_docs(query_embedding, top_k=None):
         norms = np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_embedding) + 1e-10
         sims = (embeddings @ query_embedding) / norms
 
-        top_indices = np.argsort(sims)[::-1] if top_k is None else np.argsort(sims)[::-1][:top_k]
+        # Se top_k não definido, pega todos documentos
+        if top_k is None:
+            top_indices = np.argsort(sims)[::-1]
+        else:
+            top_indices = np.argsort(sims)[::-1][:top_k]
 
         seen_files = set()
         top_texts = []
@@ -83,42 +87,54 @@ async def search_similar_docs(query_embedding, top_k=None):
 # FUNÇÃO 3: Gerar resposta com RAG + histórico
 # -----------------------------
 async def rag_answer(query: str, history=None, top_k=None):
+    """
+    query: pergunta atual do usuário
+    history: lista de mensagens anteriores, ex:
+        [
+            {"role": "user", "content": "Pergunta anterior"},
+            {"role": "assistant", "content": "Resposta anterior"}
+        ]
+    top_k: quantos documentos buscar
+    """
     if history is None:
         history = []
 
     query_emb = await get_embedding(query)
     context = await search_similar_docs(query_emb, top_k=top_k)
 
-    # Construir prompt concatenando histórico
-    history_text = ""
-    for msg in history:
-        role = "Usuário" if msg["role"]=="user" else "Assistente"
-        history_text += f"{role}: {msg['content']}\n"
-
+    # Prompt principal
     prompt = f"""
-Você é um assistente útil da TecnoTooling.
+Você é o assistente Too da TecnoTooling.
+
 Sempre que usar informação de algum documento, cite o nome do arquivo entre colchetes.
+Use o contexto completo abaixo para responder à pergunta.
 
-Histórico de conversa:
-{history_text}
-
-Contexto relevante:
+CONTEXTO RELEVANTE:
 {context}
 
-Pergunta atual:
+PERGUNTA ATUAL:
 {query}
 """
 
     logging.info(f"Prompt enviado ao Cohere Chat (primeiros 500 chars):\n{prompt[:500]}")
 
     try:
+        # Construir histórico + pergunta atual
+        inputs = []
+        for msg in history:
+            role = msg.get("role", "user")
+            inputs.append(f"{role.upper()}: {msg['content']}")
+        inputs.append(f"USER: {prompt}")
+
         response = co.chat(
             model=MODEL_LLM,
-            query=prompt,       # substitui 'messages'
-            max_tokens=600
+            inputs=inputs,
+            max_output_tokens=600
         )
-        return response.output[0].content if response.output else "Desculpe, não consegui gerar uma resposta."
+
+        # Retorna o conteúdo da primeira resposta
+        return response.output[0].content
+
     except Exception as e:
         logging.error(f"Erro ao gerar resposta com Cohere LLM: {e}")
         return "Desculpe, ocorreu um erro ao gerar a resposta."
-
