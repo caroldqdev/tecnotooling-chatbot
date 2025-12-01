@@ -83,52 +83,42 @@ async def search_similar_docs(query_embedding, top_k=None):
 # FUNÇÃO 3: Gerar resposta com RAG + histórico
 # -----------------------------
 async def rag_answer(query: str, history=None, top_k=None):
-    """
-    query: pergunta atual do usuário
-    history: lista de mensagens anteriores, ex:
-        [
-            {"role": "user", "content": "Pergunta anterior"},
-            {"role": "assistant", "content": "Resposta anterior"}
-        ]
-    top_k: quantos documentos buscar
-    """
     if history is None:
         history = []
 
     query_emb = await get_embedding(query)
     context = await search_similar_docs(query_emb, top_k=top_k)
 
+    # Construir prompt concatenando histórico
+    history_text = ""
+    for msg in history:
+        role = "Usuário" if msg["role"]=="user" else "Assistente"
+        history_text += f"{role}: {msg['content']}\n"
+
     prompt = f"""
 Você é um assistente útil da TecnoTooling.
 Sempre que usar informação de algum documento, cite o nome do arquivo entre colchetes.
-Use o contexto completo abaixo para responder à pergunta.
 
-CONTEXTO RELEVANTE:
+Histórico de conversa:
+{history_text}
+
+Contexto relevante:
 {context}
 
-PERGUNTA ATUAL:
+Pergunta atual:
 {query}
 """
 
     logging.info(f"Prompt enviado ao Cohere Chat (primeiros 500 chars):\n{prompt[:500]}")
 
     try:
-        # Construir histórico + pergunta atual
-        messages = [{"role": "system", "content": "Você se chama Too, assistente da TecnoTooling. Seja detalhista e sempre cite os documentos."}]
-        messages.extend(history)  # mensagens anteriores
-        messages.append({"role": "user", "content": prompt})  # pergunta atual
-
         response = co.chat(
             model=MODEL_LLM,
-            messages=messages,
+            query=prompt,       # substitui 'messages'
             max_tokens=600
         )
-
-        if response.output and len(response.output) > 0:
-            return response.output[0].content
-        else:
-            return "Desculpe, não consegui gerar uma resposta."
-
+        return response.output[0].content if response.output else "Desculpe, não consegui gerar uma resposta."
     except Exception as e:
         logging.error(f"Erro ao gerar resposta com Cohere LLM: {e}")
         return "Desculpe, ocorreu um erro ao gerar a resposta."
+
