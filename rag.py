@@ -37,19 +37,19 @@ MODEL_EMBED = "embed-multilingual-v2.0"  # Cohere embeddings
 async def get_embedding(text: str):
     try:
         response = co.embed(texts=[text], model=MODEL_EMBED)
-        return np.array(response.embeddings[0])
+        emb = np.array(response.embeddings[0])
+        logging.info(f"Embedding da pergunta ({len(emb)} dims): {emb[:10]} ...")  # primeiros 10 valores
+        return emb
     except Exception as e:
         logging.error(f"Erro ao gerar embedding: {e}")
-        # fallback neutro
-        return np.zeros(768)
+        return np.zeros(768)  # fallback
 
 # -------- FUNÇÃO 2: buscar top-k documentos similares --------
-async def search_similar_docs(query_embedding, k=5):
+async def search_similar_docs(query_embedding, k=3):
     results = []
     try:
         async for doc in collection_embeddings.find():
             doc_emb = np.array(doc["embedding"])
-            # Produto interno / cosseno
             similarity = np.dot(query_embedding, doc_emb) / (
                 np.linalg.norm(query_embedding) * np.linalg.norm(doc_emb) + 1e-10
             )
@@ -58,36 +58,32 @@ async def search_similar_docs(query_embedding, k=5):
         results.sort(key=lambda x: x[0], reverse=True)
         top_texts = [r[1] for r in results[:k]]
 
-        logging.info(f"Top {k} documentos mais similares: {[round(r[0], 4) for r in results[:k]]}")
-        return top_texts  # retorna lista de strings, não concatenada ainda
+        logging.info(f"Top {k} documentos mais similares (scores): {[r[0] for r in results[:k]]}")
+        for i, (sim, text) in enumerate(results[:k]):
+            logging.info(f"[{i}] Similaridade: {sim:.4f}, Texto: {text[:100]}...")  # primeiros 100 chars
+
+        return "\n".join(top_texts)
     except Exception as e:
         logging.error(f"Erro ao buscar documentos similares: {e}")
-        return []
+        return "Não foi possível buscar contexto relevante."
 
 # -------- FUNÇÃO 3: gerar resposta com RAG (Groq chat) --------
 async def rag_answer(query: str):
     query_emb = await get_embedding(query)
-    top_docs = await search_similar_docs(query_emb)
-
-    if not top_docs:
-        context = "Sem contexto relevante encontrado."
-    else:
-        # Monta prompt claro, separando cada chunk
-        context = "\n\n".join([f"--- Documento {i+1} ---\n{txt}" for i, txt in enumerate(top_docs)])
+    context = await search_similar_docs(query_emb)
 
     prompt = f"""
-Você é um assistente útil, que responde baseado no contexto fornecido.
+Você é um assistente útil.
 
 CONTEXTO RELEVANTE:
 {context}
 
-PERGUNTA DO USUÁRIO:
+PERGUNTA:
 {query}
 
-Responda de forma clara, objetiva e use somente informações do contexto acima. Se não houver informação suficiente, diga que não sabe.
+Responda de forma clara e objetiva.
 """
-
-    logging.info(f"Prompt enviado ao LLM:\n{prompt}")
+    logging.info(f"Prompt final enviado para o Groq:\n{prompt[:500]}...")  # primeiros 500 caracteres
 
     try:
         from groq import Groq
@@ -97,19 +93,21 @@ Responda de forma clara, objetiva e use somente informações do contexto acima.
         response = groq_client.chat.completions.create(
             model=MODEL_LLM,
             messages=[
-                {"role": "system", "content": "Você é um assistente útil que responde baseado em documentos."},
+                {"role": "system", "content": "Você é um assistente útil."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=400
+            max_tokens=300
         )
 
         message_obj = response.choices[0].message
+        logging.info(f"Resposta bruta do Groq: {message_obj}")
+
         if hasattr(message_obj, "content"):
-            return message_obj.content.strip()
+            return message_obj.content
         elif isinstance(message_obj, list):
-            return " ".join([m.content for m in message_obj]).strip()
+            return " ".join([m.content for m in message_obj])
         else:
-            return str(message_obj).strip()
+            return str(message_obj)
 
     except Exception as e:
         logging.error(f"Erro ao gerar resposta: {e}")
