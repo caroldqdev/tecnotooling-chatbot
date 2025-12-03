@@ -115,7 +115,7 @@ async def search_similar_docs(query_text: str, query_embedding: np.ndarray, k=5)
 # -------- FUNÇÃO 3: gerar resposta com RAG (Groq chat) --------
 async def rag_answer(query: str):
     query_emb = await get_embedding(query)
-    context = await search_similar_docs(query_emb)
+    context = await search_similar_docs(query,query_emb)
 
     prompt = f"""
 Você é um assistente útil.
