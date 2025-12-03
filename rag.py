@@ -1,10 +1,11 @@
 import os
 import numpy as np
-from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
 import logging
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 import cohere
-import asyncio
+from groq import Groq
+import httpx
 
 load_dotenv()
 
@@ -22,138 +23,184 @@ if not COHERE_API_KEY:
 if not MONGO_URI:
     raise Exception("Erro: MONGO_URI não encontrada.")
 
-# Cohere para embeddings
+# Clientes
 co = cohere.Client(COHERE_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY, http_client=httpx.Client())
 
 # Mongo
-client = AsyncIOMotorClient(MONGO_URI)
-db_embeddings = client.file_data
-collection_embeddings = db_embeddings.get_collection("embeddings")
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo["file_data"]
+collection = db["embeddings"]
 
+# Modelos
 MODEL_EMBED = "embed-multilingual-v2.0"
 MODEL_LLM = "groq/compound-mini"
 
-TOP_K = 8         # número de documentos recuperados
-MIN_SCORE = 0.25  # similaridade mínima para aceitar documento
+# Hiperparâmetros RAG
+TOP_K = 8
+MIN_SCORE = 0.25
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("RAG")
 
 
 # ========================================================
-# 1) GERA EMBEDDING NORMALIZADO
+# 0) SAUDAÇÃO ESPECIAL DO TOO
+# ========================================================
+def is_greeting(text: str) -> bool:
+    greetings = [
+        "oi", "olá", "ola", "oie", "hello", "hi", "hey",
+        "bom dia", "boa tarde", "boa noite", "tudo bem"
+    ]
+    return any(text.lower().startswith(g) for g in greetings)
+
+
+def too_greeting():
+    return {
+        "response": (
+            "Olá! Eu sou o **Too**, assistente virtual da **Tecnotooling** 🤖✨\n"
+            "Estou aqui para te ajudar a consultar documentos internos, responder dúvidas "
+            "e facilitar seu dia. Como posso te ajudar hoje?"
+        ),
+        "paths": []
+    }
+
+
+# ========================================================
+# 1) EMBEDDINGS NORMALIZADOS (ouro do RAG)
 # ========================================================
 async def get_embedding(text: str):
     try:
-        response = co.embed(texts=[text], model=MODEL_EMBED)
-        emb = np.array(response.embeddings[0])
-        # normalização (MUDA TUDO — letra de ouro do RAG)
+        res = co.embed(texts=[text], model=MODEL_EMBED)
+        emb = np.array(res.embeddings[0])
         emb = emb / (np.linalg.norm(emb) + 1e-10)
         return emb
-
     except Exception as e:
-        logging.error(f"Erro ao gerar embedding: {e}")
+        logger.error(f"Erro ao gerar embedding: {e}")
         return np.zeros(768)
 
 
 # ========================================================
-# 2) BUSCA TOP K DOCUMENTOS + SCORES + CAMINHO
+# 2) BUSCA MANUAL (cosine similarity)
 # ========================================================
-async def search_similar_docs(query_embedding, k=TOP_K):
-
-    results = []
+async def search_similar_docs(query_emb):
+    docs = []
 
     try:
-        async for doc in collection_embeddings.find():
+        async for doc in collection.find({}):
 
             doc_emb = np.array(doc["embedding"])
             doc_emb = doc_emb / (np.linalg.norm(doc_emb) + 1e-10)
 
-            # cosine similarity
-            similarity = float(np.dot(query_embedding, doc_emb))
+            score = float(np.dot(query_emb, doc_emb))
 
-            results.append({
-                "score": similarity,
+            docs.append({
+                "score": score,
                 "text": doc["text"],
-                "path": doc.get("path", "caminho_desconhecido"),
+                "path": doc.get("path", "Caminho não informado"),
                 "id": str(doc.get("_id"))
             })
 
-        # ordena por score
-        results.sort(key=lambda x: x["score"], reverse=True)
+        docs.sort(key=lambda x: x["score"], reverse=True)
 
-        # aplica score mínimo
-        filtered = [r for r in results[:k] if r["score"] >= MIN_SCORE]
+        filtered = [d for d in docs[:TOP_K] if d["score"] >= MIN_SCORE]
 
-        logging.info(f"Top documentos relevantes: {[r['score'] for r in filtered]}")
+        logger.info(f"Docs relevantes encontrados: {[round(d['score'], 4) for d in filtered]}")
 
         return filtered
 
     except Exception as e:
-        logging.error(f"Erro ao buscar documentos similares: {e}")
+        logger.error(f"Erro na busca vetorial manual: {e}")
         return []
 
 
 # ========================================================
-# 3) GERA RESPOSTA COM RAG + CAMINHOS
+# 3) CONSTRUÇÃO DO CONTEXTO
 # ========================================================
-async def rag_answer(query: str):
-    query_emb = await get_embedding(query)
-    docs = await search_similar_docs(query_emb)
-
+def build_context(docs):
     if not docs:
-        context_text = "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
-    else:
-        context_text = "\n\n".join([
+        return "NENHUM DOCUMENTO ENCONTRADO."
+
+    blocks = []
+    for i, d in enumerate(docs):
+        blocks.append(
             f"### Documento {i+1}\n"
             f"Caminho: {d['path']}\n"
             f"Score: {d['score']:.4f}\n"
-            f"Conteúdo:\n{d['text']}"
-            for i, d in enumerate(docs)
-        ])
+            f"Conteúdo:\n{d['text']}\n"
+        )
+    return "\n".join(blocks)
 
-    # PROMPT ANTI-ALUCINAÇÃO (+++)
+
+# ========================================================
+# 4) GERAR RESPOSTA COM GROQ + ANTI-ALUCINAÇÃO
+# ========================================================
+async def llm_answer(query, context):
+
     prompt = f"""
-Você é um assistente da Tecnotooling chamado Too.
-Use APENAS as informações encontradas no contexto abaixo.
+Você é **Too**, o assistente virtual da Tecnotooling.
+Use APENAS o conteúdo dos documentos do contexto.
 
-SE A RESPOSTA NÃO ESTIVER NO CONTEXTO → diga:
-
+SE A INFORMAÇÃO NÃO ESTIVER NO CONTEXTO:
+responda exatamente:
 "Não encontrei essa informação no banco de dados."
 
-📚 CONTEXTO (DOCUMENTOS ENCONTRADOS):
-{context_text}
+---
+
+📚 CONTEXTO:
+{context}
 
 ❓ PERGUNTA:
 {query}
 
-Agora responda de forma clara, objetiva e cite de qual documento a resposta veio.
+Responda de forma objetiva e, se possível, cite o documento onde encontrou a resposta.
 """
 
     try:
-        from groq import Groq
-        import httpx
-
-        groq_client = Groq(api_key=GROQ_API_KEY, http_client=httpx.Client())
-
-        response = groq_client.chat.completions.create(
+        resp = groq_client.chat.completions.create(
             model=MODEL_LLM,
+            max_tokens=400,
             messages=[
-                {"role": "system", "content": "Você se chama Too e é o assistente dos colaboradores da TecnoTooling."},
+                {"role": "system", "content": "Você é Too, o assistente da Tecnotooling."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=400
         )
 
-        message_obj = response.choices[0].message
+        msg = resp.choices[0].message
+        txt = msg.content if hasattr(msg, "content") else str(msg)
 
-        final_answer = message_obj.content if hasattr(message_obj, "content") else str(message_obj)
-
-        # adiciona caminhos no final da resposta (obrigatório)
-        if docs:
-            caminhos = "\n".join([f"- {d['path']} (score {d['score']:.4f})" for d in docs])
-        else:
-            caminhos = "Nenhum documento encontrado."
-
-        return f"{final_answer}\n\n📂 Documentos utilizados:\n{caminhos}"
+        return txt
 
     except Exception as e:
-        logging.error(f"Erro ao gerar resposta: {e}")
-        return "Desculpe, ocorreu um erro ao gerar a resposta."
+        logger.error(f"Erro ao gerar resposta LLM: {e}")
+        return "Erro ao gerar resposta."
+
+
+# ========================================================
+# 5) PIPELINE RAG COMPLETO
+# ========================================================
+async def rag_answer(query: str):
+
+    # 0) Caso seja saudação, devolve apresentação do Too
+    if is_greeting(query):
+        return too_greeting()
+
+    # 1) embedding da query
+    query_emb = await get_embedding(query)
+
+    # 2) documentos similares
+    docs = await search_similar_docs(query_emb)
+
+    # 3) gera contexto
+    context = build_context(docs)
+
+    # 4) resposta final via LLM
+    answer = await llm_answer(query, context)
+
+    # 5) lista de caminhos
+    paths = [d["path"] for d in docs] if docs else []
+
+    return {
+        "response": answer,
+        "paths": paths
+    }
