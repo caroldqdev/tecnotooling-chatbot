@@ -1,17 +1,14 @@
+# rag.py
 import os
 import numpy as np
-import logging
-from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+import logging
 import cohere
-from groq import Groq
-import httpx
 
 load_dotenv()
 
-# ======================
-# CONFIGURAÇÕES
-# ======================
+# ---- CONFIGURAÇÕES ----
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -23,184 +20,118 @@ if not COHERE_API_KEY:
 if not MONGO_URI:
     raise Exception("Erro: MONGO_URI não encontrada.")
 
-# Clientes
+# ---- CLIENTES ----
 co = cohere.Client(COHERE_API_KEY)
-groq_client = Groq(api_key=GROQ_API_KEY, http_client=httpx.Client())
 
-# Mongo
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["file_data"]
-collection = db["embeddings"]
+# ---- MONGO ----
+client = AsyncIOMotorClient(MONGO_URI)
+db_embeddings = client.file_data
+collection_embeddings = db_embeddings.get_collection("embeddings")
 
-# Modelos
-MODEL_EMBED = "embed-multilingual-v2.0"
+# ---- MODELOS ----
 MODEL_LLM = "groq/compound-mini"
+MODEL_EMBED = "embed-multilingual-v2.0"
 
-# Hiperparâmetros RAG
-TOP_K = 8
+# ---- CONTROLE DO RAG ----
+TOP_K = 5
 MIN_SCORE = 0.25
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("RAG")
 
-
-# ========================================================
-# 0) SAUDAÇÃO ESPECIAL DO TOO
-# ========================================================
-def is_greeting(text: str) -> bool:
-    greetings = [
-        "oi", "olá", "ola", "oie", "hello", "hi", "hey",
-        "bom dia", "boa tarde", "boa noite", "tudo bem"
-    ]
-    return any(text.lower().startswith(g) for g in greetings)
-
-
-def too_greeting():
-    return {
-        "response": (
-            "Olá! Eu sou o **Too**, assistente virtual da **Tecnotooling** 🤖✨\n"
-            "Estou aqui para te ajudar a consultar documentos internos, responder dúvidas "
-            "e facilitar seu dia. Como posso te ajudar hoje?"
-        ),
-        "paths": []
-    }
-
-
-# ========================================================
-# 1) EMBEDDINGS NORMALIZADOS (ouro do RAG)
-# ========================================================
+# =====================================================
+# 1) GERA EMBEDDING NORMALIZADO (OTIMIZADO)
+# =====================================================
 async def get_embedding(text: str):
     try:
-        res = co.embed(texts=[text], model=MODEL_EMBED)
-        emb = np.array(res.embeddings[0])
-        emb = emb / (np.linalg.norm(emb) + 1e-10)
+        response = co.embed(texts=[text], model=MODEL_EMBED)
+        emb = np.array(response.embeddings[0])
+
+        # ✅ NORMALIZAÇÃO (MUITO IMPORTANTE)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+
         return emb
+
     except Exception as e:
-        logger.error(f"Erro ao gerar embedding: {e}")
+        logging.error(f"Erro ao gerar embedding: {e}")
         return np.zeros(768)
 
 
-# ========================================================
-# 2) BUSCA MANUAL (cosine similarity)
-# ========================================================
-async def search_similar_docs(query_emb):
-    docs = []
+# =====================================================
+# 2) BUSCA OTIMIZADA TOP-K POR COSINE SIMILARITY
+# (SEM QUEBRAR O FORMATO DO SEU FRONT)
+# =====================================================
+async def search_similar_docs(query_embedding, k=TOP_K):
+    results = []
 
     try:
-        async for doc in collection.find({}):
-
+        async for doc in collection_embeddings.find({}, {"embedding": 1, "text": 1}):
             doc_emb = np.array(doc["embedding"])
-            doc_emb = doc_emb / (np.linalg.norm(doc_emb) + 1e-10)
 
-            score = float(np.dot(query_emb, doc_emb))
+            # ✅ NORMALIZAÇÃO DO DOCUMENTO
+            norm = np.linalg.norm(doc_emb)
+            if norm > 0:
+                doc_emb = doc_emb / norm
 
-            docs.append({
-                "score": score,
-                "text": doc["text"],
-                "path": doc.get("path", "Caminho não informado"),
-                "id": str(doc.get("_id"))
-            })
+            similarity = float(np.dot(query_embedding, doc_emb))
 
-        docs.sort(key=lambda x: x["score"], reverse=True)
+            if similarity >= MIN_SCORE:
+                results.append((similarity, doc["text"]))
 
-        filtered = [d for d in docs[:TOP_K] if d["score"] >= MIN_SCORE]
+        # ✅ ORDENA E PEGA TOP-K
+        results.sort(key=lambda x: x[0], reverse=True)
+        top_results = results[:k]
 
-        logger.info(f"Docs relevantes encontrados: {[round(d['score'], 4) for d in filtered]}")
-
-        return filtered
+        return "\n".join([r[1] for r in top_results])
 
     except Exception as e:
-        logger.error(f"Erro na busca vetorial manual: {e}")
-        return []
+        logging.error(f"Erro ao buscar documentos similares: {e}")
+        return "Não foi possível buscar contexto relevante."
 
 
-# ========================================================
-# 3) CONSTRUÇÃO DO CONTEXTO
-# ========================================================
-def build_context(docs):
-    if not docs:
-        return "NENHUM DOCUMENTO ENCONTRADO."
-
-    blocks = []
-    for i, d in enumerate(docs):
-        blocks.append(
-            f"### Documento {i+1}\n"
-            f"Caminho: {d['path']}\n"
-            f"Score: {d['score']:.4f}\n"
-            f"Conteúdo:\n{d['text']}\n"
-        )
-    return "\n".join(blocks)
-
-
-# ========================================================
-# 4) GERAR RESPOSTA COM GROQ + ANTI-ALUCINAÇÃO
-# ========================================================
-async def llm_answer(query, context):
+# =====================================================
+# 3) GERA RESPOSTA COM RAG (MANTIDO IGUAL AO SEU)
+# =====================================================
+async def rag_answer(query: str):
+    query_emb = await get_embedding(query)
+    context = await search_similar_docs(query_emb)
 
     prompt = f"""
-Você é **Too**, o assistente virtual da Tecnotooling.
-Use APENAS o conteúdo dos documentos do contexto.
+Você é um assistente útil.
 
-SE A INFORMAÇÃO NÃO ESTIVER NO CONTEXTO:
-responda exatamente:
-"Não encontrei essa informação no banco de dados."
-
----
-
-📚 CONTEXTO:
+CONTEXTO RELEVANTE:
 {context}
 
-❓ PERGUNTA:
+PERGUNTA:
 {query}
 
-Responda de forma objetiva e, se possível, cite o documento onde encontrou a resposta.
+Responda de forma clara e objetiva, sempre trazendo respostas que envolvam a Tecnotooling
 """
 
     try:
-        resp = groq_client.chat.completions.create(
+        from groq import Groq
+        import httpx
+
+        groq_client = Groq(api_key=GROQ_API_KEY, http_client=httpx.Client())
+
+        response = groq_client.chat.completions.create(
             model=MODEL_LLM,
-            max_tokens=400,
             messages=[
-                {"role": "system", "content": "Você é Too, o assistente da Tecnotooling."},
+                {"role": "system", "content": "Você se chama Too, o assistente dos colaboradores da TecnoTooling. Você deve ser prestativo e atencioso"},
                 {"role": "user", "content": prompt}
             ],
+            max_tokens=300
         )
 
-        msg = resp.choices[0].message
-        txt = msg.content if hasattr(msg, "content") else str(msg)
+        message_obj = response.choices[0].message
 
-        return txt
+        if hasattr(message_obj, "content"):
+            return message_obj.content
+        elif isinstance(message_obj, list):
+            return " ".join([m.content for m in message_obj])
+        else:
+            return str(message_obj)
 
     except Exception as e:
-        logger.error(f"Erro ao gerar resposta LLM: {e}")
-        return "Erro ao gerar resposta."
-
-
-# ========================================================
-# 5) PIPELINE RAG COMPLETO
-# ========================================================
-async def rag_answer(query: str):
-
-    # 0) Caso seja saudação, devolve apresentação do Too
-    if is_greeting(query):
-        return too_greeting()
-
-    # 1) embedding da query
-    query_emb = await get_embedding(query)
-
-    # 2) documentos similares
-    docs = await search_similar_docs(query_emb)
-
-    # 3) gera contexto
-    context = build_context(docs)
-
-    # 4) resposta final via LLM
-    answer = await llm_answer(query, context)
-
-    # 5) lista de caminhos
-    paths = [d["path"] for d in docs] if docs else []
-
-    return {
-        "response": answer,
-        "paths": paths
-    }
+        logging.error(f"Erro ao gerar resposta: {e}")
+        return "Desculpe, ocorreu um erro ao gerar a resposta."
