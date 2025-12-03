@@ -34,7 +34,7 @@ MODEL_EMBED = "embed-multilingual-v2.0"
 
 # ---- CONTROLE DO RAG ----
 TOP_K = 5
-MIN_SCORE = 0.25
+MIN_SCORE = 0.50  # ✅ mais rígido pra evitar resposta errada
 
 
 # =====================================================
@@ -45,7 +45,6 @@ async def get_embedding(text: str):
         response = co.embed(texts=[text], model=MODEL_EMBED)
         emb = np.array(response.embeddings[0])
 
-        # ✅ NORMALIZAÇÃO (MUITO IMPORTANTE)
         norm = np.linalg.norm(emb)
         if norm > 0:
             emb = emb / norm
@@ -58,9 +57,9 @@ async def get_embedding(text: str):
 
 
 # =====================================================
-# 2) BUSCA OTIMIZADA TOP-K POR COSINE SIMILARITY
+# 2) BUSCA OTIMIZADA HÍBRIDA (CÓDIGO + SEMÂNTICA)
 # =====================================================
-async def search_similar_docs(query_embedding, query_text: str, k=3, min_score=0.50):
+async def search_similar_docs(query_embedding, query_text: str):
     results = []
 
     try:
@@ -78,24 +77,19 @@ async def search_similar_docs(query_embedding, query_text: str, k=3, min_score=0
             return "\n".join([d["text"] for d in direct_hits])
 
         # -----------------------------
-        # 2) BUSCA SEMÂNTICA NORMALIZADA (COSINE REAL)
+        # 2) BUSCA SEMÂNTICA NORMALIZADA
         # -----------------------------
         async for doc in collection_embeddings.find():
             doc_emb = np.array(doc["embedding"])
-
-            # normalização dos vetores
             doc_emb = doc_emb / (np.linalg.norm(doc_emb) + 1e-10)
-            query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
 
-            similarity = float(np.dot(query_norm, doc_emb))
+            similarity = float(np.dot(query_embedding, doc_emb))
 
-            if similarity >= min_score:
+            if similarity >= MIN_SCORE:
                 results.append((similarity, doc["text"]))
 
         results.sort(key=lambda x: x[0], reverse=True)
-        top_texts = [r[1] for r in results[:k]]
-
-        logging.info(f"Top documentos com score >= {min_score}: {[r[0] for r in results[:k]]}")
+        top_texts = [r[1] for r in results[:TOP_K]]
 
         if not top_texts:
             return "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
@@ -106,12 +100,15 @@ async def search_similar_docs(query_embedding, query_text: str, k=3, min_score=0
         logging.error(f"Erro ao buscar documentos similares: {e}")
         return "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
 
+
 # =====================================================
-# 3) GERA RESPOSTA COM RAG
+# 3) GERA RESPOSTA COM RAG (SEM QUEBRAR SEU FRONT)
 # =====================================================
 async def rag_answer(query: str):
     query_emb = await get_embedding(query)
-    context = await search_similar_docs(query_emb)
+
+    # ✅ AQUI ESTAVA O ERRO DE CHAMADA
+    context = await search_similar_docs(query_emb, query)
 
     prompt = f"""
 Você é um assistente útil.
@@ -134,7 +131,10 @@ Responda de forma clara e objetiva, sempre trazendo respostas que envolvam a Tec
         response = groq_client.chat.completions.create(
             model=MODEL_LLM,
             messages=[
-                {"role": "system", "content": "Você se chama Too, o assistente dos colaboradores da TecnoTooling. Você deve ser prestativo e atencioso"},
+                {
+                    "role": "system",
+                    "content": "Você se chama Too, o assistente dos colaboradores da TecnoTooling. Você deve ser prestativo e atencioso"
+                },
                 {"role": "user", "content": prompt}
             ],
             max_tokens=300
