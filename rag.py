@@ -44,51 +44,72 @@ async def get_embedding(text: str):
         logging.error(f"Erro ao gerar embedding: {e}")
         return np.zeros(768)  # fallback
 
-# -------- FUNÇÃO 2: buscar top-k documentos similares (OTIMIZADA) --------
-async def search_similar_docs(query_embedding, k=10):
+# FUNÇÃO 2: BUSCA HÍBRIDA OTIMIZADA (LITERAL + SEMÂNTICA + CAMINHO) --------
+async def search_similar_docs(query_text: str, query_embedding: np.ndarray, k=5):
     results = []
-    MIN_SCORE = 0.45  # ✅ evita trazer coisa nada a ver
+    MIN_SCORE = 0.45
 
     try:
-        # ✅ normaliza o embedding da pergunta UMA ÚNICA VEZ
+        query_clean = query_text.strip()
+
+        # ====================================
+        # 1️⃣ BUSCA LITERAL FORTE (CNPJ, IT, REG, números, nome do arquivo)
+        # ====================================
+        literal_hits = []
+
+        async for doc in collection_embeddings.find({
+            "$or": [
+                {"text": {"$regex": query_clean, "$options": "i"}},
+                {"file_name": {"$regex": query_clean, "$options": "i"}},
+                {"file_path": {"$regex": query_clean, "$options": "i"}},
+                {"text": {"$regex": r"\d{14}", "$options": "i"}}  # padrão CNPJ
+            ]
+        }):
+            literal_hits.append(
+                f"📄 Documento: {doc.get('file_name', 'Desconhecido')}\n"
+                f"📂 Caminho: {doc.get('file_path', 'Não informado')}\n"
+                f"📝 Trecho:\n{doc.get('text', '')[:1200]}\n"
+                f"{'-'*60}"
+            )
+
+        if literal_hits:
+            logging.info("✅ Busca literal encontrou resultados.")
+            return "\n".join(literal_hits[:k])
+
+        # ====================================
+        # 2️⃣ BUSCA SEMÂNTICA (EMBEDDINGS)
+        # ====================================
         query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
 
-        # ✅ busca só os campos necessários (mais rápido)
-        async for doc in collection_embeddings.find({}, {"embedding": 1, "text": 1}):
+        async for doc in collection_embeddings.find(
+            {}, {"embedding": 1, "text": 1, "file_name": 1, "file_path": 1}
+        ):
             doc_emb = np.array(doc["embedding"])
-
-            # ✅ normaliza o embedding do documento
             doc_norm = doc_emb / (np.linalg.norm(doc_emb) + 1e-10)
 
-            # ✅ cosine similarity real
             similarity = float(np.dot(query_norm, doc_norm))
 
-            # ✅ filtro de qualidade
             if similarity >= MIN_SCORE:
-                results.append((similarity, doc["text"]))
+                results.append((
+                    similarity,
+                    f"📄 Documento: {doc.get('file_name', 'Desconhecido')}\n"
+                    f"📂 Caminho: {doc.get('file_path', 'Não informado')}\n"
+                    f"📝 Trecho:\n{doc.get('text', '')[:1200]}\n"
+                    f"{'-'*60}"
+                ))
 
-        # ✅ ordena do mais relevante pro menos
         results.sort(key=lambda x: x[0], reverse=True)
 
-        # ✅ pega só o TOP-K depois do filtro
         top_results = results[:k]
-        top_texts = [r[1] for r in top_results]
 
-        logging.info(
-            f"Top {len(top_results)} documentos (score >= {MIN_SCORE}): {[round(r[0], 4) for r in top_results]}"
-        )
+        if not top_results:
+            return "❌ Nenhum documento relevante foi encontrado no banco."
 
-        for i, (sim, text) in enumerate(top_results):
-            logging.info(f"[{i}] Similaridade: {sim:.4f}, Texto: {text[:100]}...")
-
-        if not top_texts:
-            return "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
-
-        return "\n".join(top_texts)
+        return "\n".join([r[1] for r in top_results])
 
     except Exception as e:
         logging.error(f"Erro ao buscar documentos similares: {e}")
-        return "Não foi possível buscar contexto relevante."
+        return "❌ Falha interna ao buscar documentos."
 
 
 # -------- FUNÇÃO 3: gerar resposta com RAG (Groq chat) --------
