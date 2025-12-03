@@ -59,38 +59,55 @@ async def get_embedding(text: str):
 
 # =====================================================
 # 2) BUSCA OTIMIZADA TOP-K POR COSINE SIMILARITY
-# (SEM QUEBRAR O FORMATO DO SEU FRONT)
 # =====================================================
-async def search_similar_docs(query_embedding, k=TOP_K):
+async def search_similar_docs(query_embedding, query_text: str, k=3, min_score=0.50):
     results = []
 
     try:
-        async for doc in collection_embeddings.find({}, {"embedding": 1, "text": 1}):
+        # -----------------------------
+        # 1) BUSCA DIRETA POR CÓDIGO (IT-007, POP-01, REG-00...)
+        # -----------------------------
+        direct_hits = []
+        async for doc in collection_embeddings.find({
+            "text": {"$regex": query_text, "$options": "i"}
+        }):
+            direct_hits.append(doc)
+
+        if direct_hits:
+            logging.info("Busca direta por código encontrada.")
+            return "\n".join([d["text"] for d in direct_hits])
+
+        # -----------------------------
+        # 2) BUSCA SEMÂNTICA NORMALIZADA (COSINE REAL)
+        # -----------------------------
+        async for doc in collection_embeddings.find():
             doc_emb = np.array(doc["embedding"])
 
-            # ✅ NORMALIZAÇÃO DO DOCUMENTO
-            norm = np.linalg.norm(doc_emb)
-            if norm > 0:
-                doc_emb = doc_emb / norm
+            # normalização dos vetores
+            doc_emb = doc_emb / (np.linalg.norm(doc_emb) + 1e-10)
+            query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
 
-            similarity = float(np.dot(query_embedding, doc_emb))
+            similarity = float(np.dot(query_norm, doc_emb))
 
-            if similarity >= MIN_SCORE:
+            if similarity >= min_score:
                 results.append((similarity, doc["text"]))
 
-        # ✅ ORDENA E PEGA TOP-K
         results.sort(key=lambda x: x[0], reverse=True)
-        top_results = results[:k]
+        top_texts = [r[1] for r in results[:k]]
 
-        return "\n".join([r[1] for r in top_results])
+        logging.info(f"Top documentos com score >= {min_score}: {[r[0] for r in results[:k]]}")
+
+        if not top_texts:
+            return "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
+
+        return "\n".join(top_texts)
 
     except Exception as e:
         logging.error(f"Erro ao buscar documentos similares: {e}")
-        return "Não foi possível buscar contexto relevante."
-
+        return "NENHUM DOCUMENTO RELEVANTE FOI ENCONTRADO."
 
 # =====================================================
-# 3) GERA RESPOSTA COM RAG (MANTIDO IGUAL AO SEU)
+# 3) GERA RESPOSTA COM RAG
 # =====================================================
 async def rag_answer(query: str):
     query_emb = await get_embedding(query)
